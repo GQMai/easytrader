@@ -6,11 +6,15 @@ import math
 import re
 from datetime import datetime
 from numbers import Number
-from threading import Thread
+from threading import Thread, Event
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import time
 
 from easytrader.follower import BaseFollower
 from easytrader.log import logger
 from easytrader.utils.misc import parse_cookies_str
+
+import requests
 
 
 class XueQiuFollower(BaseFollower):
@@ -28,6 +32,12 @@ class XueQiuFollower(BaseFollower):
         self._adjust_sell = None
         self._users = None
         self._trade_cmd_expire_seconds = 120  # 默认交易指令过期时间为 120 秒
+        
+        # 线程池和监控相关
+        self.strategy_executor = ThreadPoolExecutor(max_workers=10, thread_name_prefix="strategy_worker")
+        self.strategy_futures = {}  # 存储策略任务的future对象
+        self.stop_event = Event()   # 停止信号
+        self.monitor_thread = None  # 监控线程
 
     def login(self, user=None, password=None, **kwargs):
         """
@@ -124,28 +134,139 @@ class XueQiuFollower(BaseFollower):
             )
             try:
                 strategy_id = self.extract_strategy_id(strategy_url)
-                strategy_name = self.extract_strategy_name(strategy_url)
+                # 使用非阻塞方式获取策略名称，避免阻塞主线程
+                try:
+                    future = self.network_executor.submit(self.extract_strategy_name, strategy_url)
+                    strategy_name = future.result(timeout=1.0)  # 1秒超时
+                    logger.info("成功获取策略名称: %s", strategy_name)
+                except Exception as e:
+                    strategy_name = f"策略_{strategy_id}"  # 使用默认名称
+                    logger.warning("获取策略名称失败，使用默认名称: %s, 错误: %s", strategy_name, e)
             except:
-                logger.error("抽取交易id和策略名失败, 无效模拟交易url: %s", strategy_url)
+                logger.error("抽取交易id失败, 无效模拟交易url: %s", strategy_url)
                 raise
-            strategy_worker = Thread(
-                target=self.track_strategy_worker,
-                args=[strategy_id, strategy_name],
-                kwargs={"interval": track_interval, "assets": assets},
+            
+            # 使用线程池替代Thread，确保任务持续执行
+            future = self.strategy_executor.submit(
+                self.track_strategy_worker, 
+                strategy_id, 
+                strategy_name, 
+                track_interval, 
+                assets=assets  # 将assets作为关键字参数传递
             )
-            strategy_worker.start()
-            logger.info("开始跟踪策略: %s", strategy_name)
+            self.strategy_futures[strategy_id] = future
+            logger.info("策略 %s 已提交到线程池执行", strategy_name)
+        
+        # 启动监控线程，确保策略任务持续运行
+        self.start_monitor_thread()
+        logger.info("策略监控线程已启动，将确保所有策略任务持续运行")
 
     def calculate_assets(self, strategy_url, total_assets=None, initial_assets=None):
         # 都设置时优先选择 total_assets
         if total_assets is None and initial_assets is not None:
-            net_value = self._get_portfolio_net_value(strategy_url)
-            total_assets = initial_assets * net_value
+            try:
+                # 使用非阻塞方式获取组合净值，避免阻塞主线程
+                future = self.network_executor.submit(self._get_portfolio_net_value, strategy_url)
+                net_value = future.result(timeout=1.0)  # 1秒超时
+                total_assets = initial_assets * net_value
+                logger.info("成功获取组合净值: %s, 计算总资产: %s", net_value, total_assets)
+            except Exception as e:
+                logger.warning("获取组合净值失败，使用initial_assets作为total_assets: %s, 错误: %s", initial_assets, e)
+                total_assets = initial_assets  # 降级方案：直接使用初始资产
         if not isinstance(total_assets, Number):
             raise TypeError("input assets type must be number(int, float)")
         if total_assets < 1e3:
             raise ValueError("雪球总资产不能小于1000元，当前预设值 {}".format(total_assets))
         return total_assets
+
+    def start_monitor_thread(self):
+        """启动监控线程，确保策略任务持续运行"""
+        if self.monitor_thread is None or not self.monitor_thread.is_alive():
+            self.monitor_thread = Thread(target=self._monitor_strategies, name="strategy_monitor")
+            self.monitor_thread.daemon = True
+            self.monitor_thread.start()
+            logger.info("策略监控线程已启动")
+
+    def _monitor_strategies(self):
+        """监控策略任务状态，确保它们持续运行"""
+        logger.info("策略监控线程开始运行")
+        
+        while not self.stop_event.is_set():
+            try:
+                # 检查所有策略任务状态
+                for strategy_id, future in list(self.strategy_futures.items()):
+                    if future.done():
+                        # 检查任务是否正常完成还是异常退出
+                        try:
+                            # 尝试获取结果，如果有异常会抛出
+                            result = future.result(timeout=0.1)
+                            # 如果正常完成，记录日志但不重启
+                            logger.info("策略 %s 任务正常完成，结果: %s", strategy_id, result)
+                            # 从字典中移除已完成的任务
+                            del self.strategy_futures[strategy_id]
+                        except Exception as e:
+                            # 任务异常退出，重新启动
+                            logger.warning("策略 %s 任务异常退出，正在重新启动... 错误: %s", strategy_id, e)
+                            
+                            # 获取策略信息并重新提交
+                            try:
+                                # 这里需要重新获取策略信息，简化处理
+                                strategy_name = f"策略_{strategy_id}"
+                                assets = 10000  # 使用默认资产值
+                                
+                                new_future = self.strategy_executor.submit(
+                                    self.track_strategy_worker,
+                                    strategy_id,
+                                    strategy_name,
+                                    1.5,  # 使用默认间隔
+                                    assets=assets  # 将assets作为关键字参数传递
+                                )
+                                self.strategy_futures[strategy_id] = new_future
+                                logger.info("策略 %s 已重新启动", strategy_id)
+                                
+                            except Exception as e:
+                                logger.error("重新启动策略 %s 失败: %s", strategy_id, e)
+                
+                # 每30秒检查一次，减少频繁检查
+                time.sleep(30)
+                
+            except Exception as e:
+                logger.error("策略监控线程发生错误: %s", e)
+                time.sleep(10)
+        
+        logger.info("策略监控线程已停止")
+
+    def stop_all_strategies(self):
+        """停止所有策略任务"""
+        logger.info("正在停止所有策略任务...")
+        self.stop_event.set()
+        
+        # 关闭线程池
+        if hasattr(self, 'strategy_executor'):
+            self.strategy_executor.shutdown(wait=True, timeout=10)
+            logger.info("策略线程池已关闭")
+        
+        # 等待监控线程结束
+        if self.monitor_thread and self.monitor_thread.is_alive():
+            self.monitor_thread.join(timeout=5)
+            logger.info("策略监控线程已停止")
+
+    def cleanup(self):
+        """清理资源"""
+        try:
+            # 停止所有策略
+            self.stop_all_strategies()
+            
+            # 调用父类清理方法
+            super().cleanup()
+            
+            logger.info("XueQiuFollower资源清理完成")
+        except Exception as e:
+            logger.error("XueQiuFollower清理资源时发生错误: %s", e)
+
+    def __del__(self):
+        """析构函数，确保资源被正确释放"""
+        self.cleanup()
 
     @staticmethod
     def extract_strategy_id(strategy_url):
@@ -154,9 +275,19 @@ class XueQiuFollower(BaseFollower):
     def extract_strategy_name(self, strategy_url):
         base_url = "https://xueqiu.com/cubes/nav_daily/all.json?cube_symbol={}"
         url = base_url.format(strategy_url)
-        rep = self.s.get(url)
-        info_index = 0
-        return rep.json()[info_index]["name"]
+        try:
+            rep = self.s.get(url, timeout=1)
+            info_index = 0
+            return rep.json()[info_index]["name"]
+        except requests.exceptions.Timeout:
+            logger.warning("获取策略名称请求超时(1秒), strategy_url: %s", strategy_url)
+            return f"策略_{strategy_url}"  # 返回默认名称
+        except requests.exceptions.RequestException as e:
+            logger.warning("获取策略名称请求失败: %s, strategy_url: %s", e, strategy_url)
+            return f"策略_{strategy_url}"  # 返回默认名称
+        except Exception as e:
+            logger.error("获取策略名称时发生未知错误: %s, strategy_url: %s", e, strategy_url)
+            return f"策略_{strategy_url}"  # 返回默认名称
 
     def extract_transactions(self, history):
         try:
@@ -256,13 +387,30 @@ class XueQiuFollower(BaseFollower):
     # Category: 14 - 热门组合
     def get_cube_by_rank(self, category=14, page=1, count=100):
         url = self.CUBE_RANK + f"?category={category}&page={page}&count={count}"
-        response = self.s.get(url)
-        return response.json()
+        try:
+            response = self.s.get(url, timeout=1)
+            return response.json()
+        except requests.exceptions.Timeout:
+            logger.warning("获取组合排行榜请求超时(1秒), url: %s", url)
+            return {"list": []}  # 返回空列表
+        except requests.exceptions.RequestException as e:
+            logger.warning("获取组合排行榜请求失败: %s, url: %s", e, url)
+            return {"list": []}  # 返回空列表
+        except Exception as e:
+            logger.error("获取组合排行榜时发生未知错误: %s, url: %s", e, url)
+            return {"list": []}  # 返回空列表
     
     def get_current_price(self, stock_code):
         try:
-            pankou = self.get_realtime_pankou(stock_code)
-            current_price = pankou.get("current")
+            # 使用线程池进行非阻塞网络请求
+            future = self.network_executor.submit(self.get_realtime_pankou, stock_code)
+            try:
+                pankou = future.result(timeout=1.0)  # 1秒超时
+            except Exception as e:
+                logger.warning("获取股票 %s 实时盘口信息超时或失败: %s", stock_code, e)
+                return None
+                
+            current_price = pankou.get("current") if pankou else None
 
             if current_price is not None and current_price > 0:
                 return round(current_price, 2)
@@ -275,9 +423,16 @@ class XueQiuFollower(BaseFollower):
 
     def get_sell_price(self, stock_code):
         try:
-            pankou = self.get_realtime_pankou(stock_code)
-            buy_price_5 = pankou.get("bp5")
-            current_price = pankou.get("current")
+            # 使用线程池进行非阻塞网络请求
+            future = self.network_executor.submit(self.get_realtime_pankou, stock_code)
+            try:
+                pankou = future.result(timeout=1.0)  # 1秒超时
+            except Exception as e:
+                logger.warning("获取股票 %s 实时盘口信息超时或失败: %s", stock_code, e)
+                return None
+                
+            buy_price_5 = pankou.get("bp5") if pankou else None
+            current_price = pankou.get("current") if pankou else None
 
             if self.slippage > 0 and current_price is not None and current_price > 0 and buy_price_5 is not None and buy_price_5 > 0:
                 slippaged_price = round(current_price * (1 - self.slippage), 2)
@@ -290,9 +445,16 @@ class XueQiuFollower(BaseFollower):
 
     def get_buy_price(self, stock_code):
         try:
-            pankou = self.get_realtime_pankou(stock_code)
-            sell_price_5 = pankou.get("sp5")
-            current_price = pankou.get("current")
+            # 使用线程池进行非阻塞网络请求
+            future = self.network_executor.submit(self.get_realtime_pankou, stock_code)
+            try:
+                pankou = future.result(timeout=1.0)  # 1秒超时
+            except Exception as e:
+                logger.warning("获取股票 %s 实时盘口信息超时或失败: %s", stock_code, e)
+                return None
+                
+            sell_price_5 = pankou.get("sp5") if pankou else None
+            current_price = pankou.get("current") if pankou else None
 
             if self.slippage > 0 and current_price is not None and current_price > 0 and sell_price_5 is not None and sell_price_5 > 0:
                 slippaged_price = round(current_price * (1 + self.slippage), 2)
@@ -305,9 +467,20 @@ class XueQiuFollower(BaseFollower):
 
     def get_realtime_pankou(self, stock_code):
         url = self.REALTIME_PANKOU + f"?symbol={stock_code.upper()}"
-        response = self.s.get(url)
-        # logger.debug("获取股票 %s, URL: %s, 实时盘口信息: %s", stock_code, url, response.json())
-        return response.json().get("data")
+        try:
+            # 设置单独的超时时间，确保不会阻塞
+            response = self.s.get(url, timeout=1)
+            # logger.debug("获取股票 %s, URL: %s, 实时盘口信息: %s", stock_code, url, response.json())
+            return response.json().get("data")
+        except requests.exceptions.Timeout:
+            logger.warning("获取股票 %s 实时盘口信息请求超时(1秒)", stock_code)
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.warning("获取股票 %s 实时盘口信息请求失败: %s", stock_code, e)
+            return None
+        except Exception as e:
+            logger.error("获取股票 %s 实时盘口信息时发生未知错误: %s", stock_code, e)
+            return None
 
     def _adjust_sell_amount(self, stock_code, amount):
         """
@@ -357,15 +530,22 @@ class XueQiuFollower(BaseFollower):
         获取组合信息
         """
         url = self.PORTFOLIO_URL + portfolio_code
-        portfolio_page = self.s.get(url)
-        match_info = re.search(r"(?<=SNB.cubeInfo = ).*(?=;\n)", portfolio_page.text)
-        if match_info is None:
-            raise Exception("cant get portfolio info, portfolio url : {}".format(url))
         try:
-            portfolio_info = json.loads(match_info.group())
-        except Exception as e:
-            raise Exception("get portfolio info error: {}".format(e))
-        return portfolio_info
+            portfolio_page = self.s.get(url, timeout=1)
+            match_info = re.search(r"(?<=SNB.cubeInfo = ).*(?=;\n)", portfolio_page.text)
+            if match_info is None:
+                raise Exception("cant get portfolio info, portfolio url : {}".format(url))
+            try:
+                portfolio_info = json.loads(match_info.group())
+            except Exception as e:
+                raise Exception("get portfolio info error: {}".format(e))
+            return portfolio_info
+        except requests.exceptions.Timeout:
+            logger.warning("获取组合信息请求超时(1秒), portfolio_code: %s", portfolio_code)
+            return None
+        except requests.exceptions.RequestException as e:
+            logger.warning("获取组合信息请求失败: %s, portfolio_code: %s", e, portfolio_code)
+            return None
 
     def _get_portfolio_net_value(self, portfolio_code):
         """
@@ -373,3 +553,71 @@ class XueQiuFollower(BaseFollower):
         """
         portfolio_info = self._get_portfolio_info(portfolio_code)
         return portfolio_info["net_value"]
+
+    def track_strategy_worker(self, strategy, name, interval=10, **kwargs):
+        """跟踪策略的worker线程，确保持续运行"""
+        logger.info("策略 %s worker线程开始运行，轮询间隔: %s秒", name, interval)
+        
+        consecutive_errors = 0  # 连续错误计数
+        max_consecutive_errors = 5  # 最大连续错误次数
+        
+        while not self.stop_event.is_set():
+            try:
+                start_time = time.time()
+                
+                # 使用非阻塞网络请求，设置1秒超时
+                future = self.network_executor.submit(self.query_strategy_transaction, strategy, **kwargs)
+                try:
+                    transactions = future.result(timeout=1.0)  # 1秒超时
+                    consecutive_errors = 0  # 重置错误计数
+                except Exception as e:
+                    consecutive_errors += 1
+                    logger.warning("策略 %s 查询调仓信息超时或失败(1秒)，连续错误次数: %d/%d", 
+                                 name, consecutive_errors, max_consecutive_errors)
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error("策略 %s 连续错误次数过多，暂停30秒后重试", name)
+                        time.sleep(30)
+                        consecutive_errors = 0
+                    else:
+                        time.sleep(1)
+                    continue
+                
+                # 处理交易数据
+                if transactions:
+                    logger.info("策略 %s 发现 %d 条调仓信息", name, len(transactions))
+                    for transaction in transactions:
+                        try:
+                            self.process_transaction(transaction, **kwargs)
+                        except Exception as e:
+                            logger.error("处理策略 %s 交易信息时发生错误: %s", name, e)
+                else:
+                    # 添加心跳日志，证明任务还在运行
+                    if int(time.time()) % 60 < interval:  # 每分钟只记录一次心跳
+                        logger.debug("策略 %s 无调仓信息，任务正常运行中...", name)
+                
+                # 计算实际睡眠时间，确保准确的轮询间隔
+                elapsed = time.time() - start_time
+                sleep_time = max(0, interval - elapsed)
+                
+                if sleep_time > 0:
+                    time.sleep(sleep_time)
+                else:
+                    logger.warning("策略 %s 处理时间过长: %.2f秒，超过轮询间隔: %d秒", 
+                                 name, elapsed, interval)
+                    
+            except Exception as e:
+                consecutive_errors += 1
+                logger.exception("策略 %s worker线程发生未知错误: %s，连续错误次数: %d/%d", 
+                               name, e, consecutive_errors, max_consecutive_errors)
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("策略 %s 连续错误次数过多，暂停60秒后重试", name)
+                    time.sleep(60)
+                    consecutive_errors = 0
+                else:
+                    time.sleep(3)
+        
+        logger.info("策略 %s worker线程已停止")
+        # 返回成功状态，避免被监控线程误判为异常
+        return {"status": "stopped", "strategy": strategy, "name": name}

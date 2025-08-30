@@ -8,6 +8,7 @@ import re
 import threading
 import time
 from typing import List
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 
 import requests
 
@@ -33,6 +34,11 @@ class BaseFollower(metaclass=abc.ABCMeta):
 
         self.s = requests.Session()
         self.s.verify = False
+        # 设置默认超时时间为1秒
+        self.s.timeout = 1
+        
+        # 创建线程池用于非阻塞网络请求
+        self.network_executor = ThreadPoolExecutor(max_workers=5, thread_name_prefix="network_req")
 
         self.slippage: float = 0.0
 
@@ -177,14 +183,20 @@ class BaseFollower(metaclass=abc.ABCMeta):
         :param interval: 轮询策略的时间间隔，单位为秒"""
         while True:
             try:
-                transactions = self.query_strategy_transaction(
-                    strategy, **kwargs
-                )
+                # 使用非阻塞网络请求，设置1秒超时
+                future = self.network_executor.submit(self.query_strategy_transaction, strategy, **kwargs)
+                try:
+                    transactions = future.result(timeout=1.0)  # 1秒超时
+                except FutureTimeoutError:
+                    logger.warning("策略 %s 查询调仓信息超时(1秒)，跳过本次查询", name)
+                    time.sleep(1)
+                    continue
             # pylint: disable=broad-except
             except Exception as e:
                 logger.exception("无法获取策略 %s 调仓信息, 错误: %s, 跳过此次调仓查询", name, e)
                 time.sleep(3)
                 continue
+                
             for transaction in transactions:
                 try:
                     trade_cmd = {
@@ -350,18 +362,50 @@ class BaseFollower(metaclass=abc.ABCMeta):
         :param send_interval: 交易发送间隔， 默认为0s。调大可防止卖出买入时买出单没有及时成交导致的买入金额不足
         """
         while True:
-            trade_cmd = self.trade_queue.get()
-            logger.info(f"开始执行交易指令: {trade_cmd}")
-            self._execute_trade_cmd(
-                trade_cmd, users, expire_seconds, entrust_prop, send_interval
-            )
-            time.sleep(send_interval)
+            try:
+                # 非阻塞方式获取交易指令，避免无限等待
+                try:
+                    trade_cmd = self.trade_queue.get(timeout=1.0)  # 1秒超时
+                except queue.Empty:
+                    # 队列为空，继续循环
+                    time.sleep(0.1)
+                    continue
+                
+                logger.info(f"开始执行交易指令: {trade_cmd}")
+                
+                # 使用线程池执行交易，避免阻塞交易线程
+                try:
+                    future = self.network_executor.submit(
+                        self._execute_trade_cmd,
+                        trade_cmd, users, expire_seconds, entrust_prop, send_interval
+                    )
+                    # 设置交易执行超时，避免无限等待
+                    future.result(timeout=3.0)  # 3秒超时
+                    logger.info(f"交易指令执行完成: {trade_cmd}")
+                except Exception as e:
+                    logger.error(f"交易指令执行失败: {trade_cmd}, 错误: {e}")
+                
+                time.sleep(send_interval)
+                
+            except Exception as e:
+                logger.exception(f"交易worker线程发生错误: {e}")
+                time.sleep(1)  # 错误后短暂等待
 
     def query_strategy_transaction(self, strategy, **kwargs):
         params = self.create_query_transaction_params(strategy)
 
-        rep = self.s.get(self.TRANSACTION_API, params=params)
-        history = rep.json()
+        try:
+            rep = self.s.get(self.TRANSACTION_API, params=params, timeout=1)
+            history = rep.json()
+        except requests.exceptions.Timeout:
+            logger.warning("查询策略 %s 调仓信息请求超时(1秒)", strategy)
+            return []
+        except requests.exceptions.RequestException as e:
+            logger.warning("查询策略 %s 调仓信息请求失败: %s", strategy, e)
+            return []
+        except Exception as e:
+            logger.error("查询策略 %s 调仓信息时发生未知错误: %s", strategy, e)
+            return []
 
         transactions = self.extract_transactions(history)
         self.project_transactions(transactions, **kwargs)
@@ -412,3 +456,16 @@ class BaseFollower(metaclass=abc.ABCMeta):
             else:
                 sell_first_transactions.append(transaction)
         return sell_first_transactions
+
+    def cleanup(self):
+        """清理资源，关闭线程池"""
+        try:
+            if hasattr(self, 'network_executor'):
+                self.network_executor.shutdown(wait=True, timeout=5)
+                logger.info("网络请求线程池已关闭")
+        except Exception as e:
+            logger.error("关闭线程池时发生错误: %s", e)
+
+    def __del__(self):
+        """析构函数，确保资源被正确释放"""
+        self.cleanup()
