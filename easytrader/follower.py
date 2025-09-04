@@ -181,55 +181,109 @@ class BaseFollower(metaclass=abc.ABCMeta):
         :param strategy: 策略id
         :param name: 策略名字
         :param interval: 轮询策略的时间间隔，单位为秒"""
+        logger.info("策略 %s worker线程开始运行，轮询间隔: %s秒", name, interval)
+        
+        consecutive_errors = 0  # 连续错误计数
+        max_consecutive_errors = 5  # 最大连续错误次数
+        
+        # 检查是否有 stop_event 属性（用于优雅停止）
+        stop_event = getattr(self, 'stop_event', None)
+        
         while True:
+            # 如果有 stop_event 且已设置，则退出
+            if stop_event and stop_event.is_set():
+                break
+                
             try:
+                start_time = time.time()
+                
                 # 使用非阻塞网络请求，设置1秒超时
                 future = self.network_executor.submit(self.query_strategy_transaction, strategy, **kwargs)
                 try:
                     transactions = future.result(timeout=1.0)  # 1秒超时
+                    consecutive_errors = 0  # 重置错误计数
                 except FutureTimeoutError:
-                    logger.warning("策略 %s 查询调仓信息超时(1秒)，跳过本次查询", name)
-                    time.sleep(1)
+                    consecutive_errors += 1
+                    logger.warning("策略 %s 查询调仓信息超时(1秒)，连续错误次数: %d/%d", 
+                                 name, consecutive_errors, max_consecutive_errors)
+                    
+                    if consecutive_errors >= max_consecutive_errors:
+                        logger.error("策略 %s 连续错误次数过多，暂停30秒后重试", name)
+                        time.sleep(30)
+                        consecutive_errors = 0
+                    else:
+                        time.sleep(1)
                     continue
             # pylint: disable=broad-except
             except Exception as e:
-                logger.exception("无法获取策略 %s 调仓信息, 错误: %s, 跳过此次调仓查询", name, e)
-                time.sleep(3)
+                consecutive_errors += 1
+                logger.exception("策略 %s 获取调仓信息时发生错误: %s，连续错误次数: %d/%d", 
+                               name, e, consecutive_errors, max_consecutive_errors)
+                
+                if consecutive_errors >= max_consecutive_errors:
+                    logger.error("策略 %s 连续错误次数过多，暂停60秒后重试", name)
+                    time.sleep(60)
+                    consecutive_errors = 0
+                else:
+                    time.sleep(3)
                 continue
                 
-            for transaction in transactions:
-                try:
-                    trade_cmd = {
-                        "strategy": strategy,
-                        "strategy_name": name,
-                        "action": transaction["action"],
-                        "stock_code": transaction["stock_code"],
-                        "amount": transaction["amount"],
-                        "price": transaction["price"],
-                        "datetime": transaction["datetime"],
-                    }
-                    if self.is_cmd_expired(trade_cmd):
+            # 处理交易数据
+            if transactions:
+                logger.info("策略 %s 发现 %d 条调仓信息", name, len(transactions))
+                for transaction in transactions:
+                    try:
+                        trade_cmd = {
+                            "strategy": strategy,
+                            "strategy_name": name,
+                            "action": transaction["action"],
+                            "stock_code": transaction["stock_code"],
+                            "amount": transaction["amount"],
+                            "price": transaction["price"],
+                            "datetime": transaction["datetime"],
+                        }
+                        if self.is_cmd_expired(trade_cmd):
+                            continue
+                        logger.info(
+                            "策略 [%s] 发送指令到交易队列, 股票: %s 动作: %s 数量: %s 价格: %s 信号产生时间: %s",
+                            name,
+                            trade_cmd["stock_code"],
+                            trade_cmd["action"],
+                            trade_cmd["amount"],
+                            trade_cmd["price"],
+                            trade_cmd["datetime"],
+                        )
+                        self.trade_queue.put(trade_cmd)
+                        self.add_cmd_to_expired_cmds(trade_cmd)
+                    except Exception as e:
+                        logger.exception("策略 [%s] 处理调仓记录 %s 失败, 错误: %s", name, transaction, e)
                         continue
-                    logger.info(
-                        "策略 [%s] 发送指令到交易队列, 股票: %s 动作: %s 数量: %s 价格: %s 信号产生时间: %s",
-                        name,
-                        trade_cmd["stock_code"],
-                        trade_cmd["action"],
-                        trade_cmd["amount"],
-                        trade_cmd["price"],
-                        trade_cmd["datetime"],
-                    )
-                    self.trade_queue.put(trade_cmd)
-                    self.add_cmd_to_expired_cmds(trade_cmd)
-                except Exception as e:
-                    logger.exception("策略 [%s] 处理调仓记录 %s 失败, 错误: %s", name, transaction, e)
-                    continue
-            try:
-                for _ in range(int(interval * 10)):  # 將 interval 乘以 10，再轉換為整數
-                    time.sleep(0.1)  # 每次睡眠 0.1 秒
-            except KeyboardInterrupt:
-                logger.info("程序退出")
-                break
+            else:
+                # 添加心跳日志，证明任务还在运行
+                if int(time.time()) % 60 < interval:  # 每分钟只记录一次心跳
+                    logger.debug("策略 %s 无调仓信息，任务正常运行中...", name)
+            
+            # 计算实际睡眠时间，确保准确的轮询间隔
+            elapsed = time.time() - start_time
+            sleep_time = max(0, interval - elapsed)
+            
+            if sleep_time > 0:
+                try:
+                    # 支持中断的睡眠
+                    for _ in range(int(sleep_time * 10)):  # 将秒转换为0.1秒的循环
+                        if stop_event and stop_event.is_set():
+                            break
+                        time.sleep(0.1)
+                except KeyboardInterrupt:
+                    logger.info("程序退出")
+                    break
+            else:
+                logger.warning("策略 %s 处理时间过长: %.2f秒，超过轮询间隔: %d秒", 
+                             name, elapsed, interval)
+        
+        logger.info("策略 %s worker线程已停止")
+        # 返回成功状态，避免被监控线程误判为异常
+        return {"status": "stopped", "strategy": strategy, "name": name}
 
     @staticmethod
     def generate_expired_cmd_key(cmd):
@@ -396,12 +450,20 @@ class BaseFollower(metaclass=abc.ABCMeta):
 
         try:
             rep = self.s.get(self.TRANSACTION_API, params=params, timeout=1)
+            # 添加HTTP状态码检查
+            if rep.status_code != 200:
+                logger.warning("查询策略 %s 调仓信息HTTP错误: %d, 响应: %s", 
+                             strategy, rep.status_code, rep.text[:200])
+                return []
             history = rep.json()
         except requests.exceptions.Timeout:
             logger.warning("查询策略 %s 调仓信息请求超时(1秒)", strategy)
             return []
         except requests.exceptions.RequestException as e:
             logger.warning("查询策略 %s 调仓信息请求失败: %s", strategy, e)
+            return []
+        except ValueError as e:
+            logger.error("查询策略 %s 调仓信息JSON解析失败: %s", strategy, e)
             return []
         except Exception as e:
             logger.error("查询策略 %s 调仓信息时发生未知错误: %s", strategy, e)
@@ -461,7 +523,7 @@ class BaseFollower(metaclass=abc.ABCMeta):
         """清理资源，关闭线程池"""
         try:
             if hasattr(self, 'network_executor'):
-                self.network_executor.shutdown(wait=True, timeout=5)
+                self.network_executor.shutdown(wait=True)
                 logger.info("网络请求线程池已关闭")
         except Exception as e:
             logger.error("关闭线程池时发生错误: %s", e)
